@@ -11,9 +11,9 @@ Run:  python3 storage_doctor.py
 
 import os
 import plistlib
+import re
 import shlex
 import subprocess
-import tempfile
 import threading
 import shutil
 import time
@@ -26,13 +26,46 @@ HOME = os.path.expanduser("~")
 # ---------------------------------------------------------------- helpers
 
 def du_bytes(path: str) -> int:
+    """Apparent (logical) size — the number Finder / System Settings show,
+    which is what the user compares against. Plain `du` reports physical
+    allocated blocks and over-reports ~5-7% on APFS. `-A` gives apparent
+    size; fall back to physical on the rare system where `-A` is absent so
+    we never silently report 0 for a real directory."""
+    for flags in ("-skA", "-sk"):
+        try:
+            out = subprocess.run(["du", flags, path],
+                                 capture_output=True, text=True, timeout=600)
+            line = out.stdout.strip()
+            if line:
+                return int(line.split()[0]) * 1024
+        except Exception:
+            continue
+    return 0
+
+
+def disk_stats():
+    """(total, used, free) matching System Settings / Finder. Reads the APFS
+    container from `diskutil` so `free` includes purgeable space and `total`
+    is the real container size — `shutil.disk_usage` undercounts both on APFS.
+    Falls back to shutil if diskutil is unavailable."""
     try:
-        out = subprocess.run(
-            ["du", "-sk", path], capture_output=True, text=True, timeout=600
-        )
-        return int(out.stdout.split()[0]) * 1024
+        out = subprocess.run(["diskutil", "info", "/"],
+                             capture_output=True, text=True, timeout=10).stdout
+        total = free = None
+        for line in out.splitlines():
+            m = re.search(r"\((\d+) Bytes\)", line)
+            if not m:
+                continue
+            if "Container Total Space" in line:
+                total = int(m.group(1))
+            elif "Container Free Space" in line:
+                free = int(m.group(1))
+        if total and free is not None:
+            return total, total - free, free
     except Exception:
-        return 0
+        pass
+    u = shutil.disk_usage(HOME)
+    return u.total, u.used, u.free
 
 
 def fmt_size(n: float) -> str:
@@ -62,6 +95,59 @@ def notify(msg: str, title: str = "Storage Doctor"):
         ["osascript", "-e",
          f'display notification "{msg}" with title "{title}" sound name "Glass"'],
         capture_output=True, timeout=10)
+
+
+NEVER_KILL = {"kernel_task", "launchd", "WindowServer", "loginwindow",
+              "Finder", "Dock", "SystemUIServer", "launchservicesd",
+              "WindowManager", "coreaudiod", "securityd", "opendirectoryd"}
+
+
+def proc_safety(path: str, name: str) -> str:
+    """SAFE = your app, fine to quit. CAUTION = may lose unsaved work.
+    SYSTEM = macOS itself, never terminate."""
+    if name in NEVER_KILL or path.startswith(
+            ("/System/", "/usr/", "/sbin/", "/bin/")):
+        return "SYSTEM"
+    low = name.lower()
+    if any(k in low for k in ("helper", "renderer", "plugin", "gpu",
+                              "utility", "extension", "node", "npm",
+                              "mdworker", "cache")):
+        return "SAFE"
+    return "CAUTION"
+
+
+def _f(x) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def mem_stats():
+    """(total, used, compressed, swap_str). `used` = active+wired+compressed
+    pages (the 'app memory' + wired Activity Monitor shows), matching what a
+    user reads as RAM in use."""
+    total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                capture_output=True, text=True, timeout=5).stdout.strip() or 0)
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                         timeout=5).stdout
+    m = re.search(r"page size of (\d+)", out)
+    ps = int(m.group(1)) if m else 4096
+
+    def g(key):
+        mm = re.search(re.escape(key) + r":\s+(\d+)", out)
+        return int(mm.group(1)) if mm else 0
+
+    comp = g("Pages occupied by compressor") * ps
+    used = (g("Pages active") + g("Pages wired down")) * ps + comp
+    swap = "0"
+    try:
+        sw = subprocess.run(["sysctl", "-n", "vm.swapusage"],
+                            capture_output=True, text=True, timeout=5).stdout
+        swap = sw.split("used =")[1].split()[0]
+    except Exception:
+        pass
+    return total, used, comp, swap
 
 
 # ---------------------------------------------------------------- targets
@@ -134,6 +220,19 @@ def build_targets():
         RISK_SAFE, "re-downloads pods")
     add(cat, "Gradle caches", os.path.join(HOME, ".gradle/caches"), RISK_SAFE,
         "re-downloads dependencies; first build slower")
+    add(cat, "Maven repository", os.path.join(HOME, ".m2/repository"),
+        RISK_SAFE, "re-downloads jars on next build")
+    add(cat, "NuGet packages", os.path.join(HOME, ".nuget/packages"),
+        RISK_SAFE, "re-downloads .NET packages")
+    add(cat, ".NET package cache", os.path.join(HOME, ".dotnet"),
+        RISK_CAUTION, "re-downloads .NET SDK bits")
+    add(cat, "RubyGems cache", os.path.join(HOME, ".gem"),
+        RISK_SAFE, "re-downloads gems")
+    if which("rustup"):
+        add(cat, "Rust toolchains", os.path.join(HOME, ".rustup/toolchains"),
+            RISK_CAUTION, "rustup toolchain install re-fetches; needed to build")
+    add(cat, "Nix store note", os.path.join(HOME, ".cache/nix"), RISK_SAFE,
+        "nix eval cache; rebuilds")
 
     cat = "Caches & Temp"
     add(cat, "System temp (/private/tmp)", "/private/tmp", RISK_CAUTION,
@@ -254,14 +353,41 @@ def dynamic_targets(progress_cb):
             found.append(Target("Chat & Media Apps", name, p, RISK_CAUTION,
                                 note, ("rm_contents", p)))
 
+    # -- generic Electron/Chromium cache sweep: most desktop apps (Notion,
+    # Figma, Obsidian, VS Code, Cursor, Spotify, ...) hide GBs here. Every
+    # such cache >50 MB becomes its own row. --
+    progress_cb("Sweeping Electron/Chromium app caches (deep)...")
+    seen = {t.path for t in found}
+    appsup = os.path.join(HOME, "Library/Application Support")
+    CACHE_SUBDIRS = ("Cache", "Code Cache", "GPUCache", "CachedData",
+                     "DawnCache", "ShaderCache", "Service Worker/CacheStorage")
+    if os.path.isdir(appsup):
+        for app in sorted(os.listdir(appsup)):
+            base = os.path.join(appsup, app)
+            if app.startswith(".") or not os.path.isdir(base):
+                continue
+            for sub in CACHE_SUBDIRS:
+                p = os.path.join(base, sub)
+                if p in seen or not os.path.isdir(p):
+                    continue
+                sz = du_bytes(p)
+                if sz > 50 * 1024 * 1024:
+                    tgt = Target("Electron App Caches (deep)",
+                                 f"{app} — {sub}", p, RISK_SAFE,
+                                 "app cache — rebuilds on next launch",
+                                 ("rm_contents", p))
+                    tgt.size = sz
+                    tgt.age = age_days(p)
+                    found.append(tgt)
+
     # -- python virtualenvs --
     progress_cb("Hunting Python venvs...")
     try:
         out = subprocess.run(
-            ["find", HOME, "-maxdepth", "4", "-type", "d",
+            ["find", HOME, "-maxdepth", "6", "-type", "d",
              "(", "-name", ".venv", "-o", "-name", "venv", ")",
              "-prune", "-not", "-path", f"{HOME}/Library/*"],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, timeout=180)
         for p in out.stdout.strip().splitlines():
             if not os.path.exists(os.path.join(p, "pyvenv.cfg")):
                 continue
@@ -275,16 +401,16 @@ def dynamic_targets(progress_cb):
         pass
 
     # -- huge individual files anywhere in home --
-    progress_cb("Hunting files > 500 MB (this takes a moment)...")
+    progress_cb("Hunting files > 200 MB (this takes a moment)...")
     try:
         out = subprocess.run(
-            ["find", HOME, "-xdev", "-type", "f", "-size", "+500M",
+            ["find", HOME, "-xdev", "-type", "f", "-size", "+200M",
              "-not", "-path", "*orbstack*",
              "-not", "-path", f"{HOME}/.colima/*",
              "-not", "-path", f"{HOME}/Library/Containers/com.docker.docker/*"],
             capture_output=True, text=True, timeout=180)
         for p in out.stdout.strip().splitlines():
-            tgt = Target("Huge Files (>500 MB)", p.replace(HOME, "~"), p,
+            tgt = Target("Huge Files (>200 MB)", p.replace(HOME, "~"), p,
                          RISK_CAUTION,
                          "single big file — double-click to reveal in Finder",
                          ("rm", p))
@@ -300,9 +426,9 @@ def dynamic_targets(progress_cb):
     progress_cb("Hunting node_modules across projects...")
     try:
         out = subprocess.run(
-            ["find", HOME, "-maxdepth", "4", "-name", "node_modules",
+            ["find", HOME, "-maxdepth", "6", "-name", "node_modules",
              "-type", "d", "-prune", "-not", "-path", f"{HOME}/Library/*"],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, timeout=180)
         for p in out.stdout.strip().splitlines():
             a = age_days(os.path.dirname(p))
             stale = f", project untouched {a}d" if a > 30 else ""
@@ -327,44 +453,103 @@ def dynamic_targets(progress_cb):
 
     # -- installed applications: deep uninstall (bundle + all leftovers) --
     progress_cb("Listing installed applications...")
-    apps_dir = "/Applications"
-    if os.path.isdir(apps_dir):
-        for f in sorted(os.listdir(apps_dir)):
-            if not f.endswith(".app") or f.startswith("."):
-                continue
-            p = os.path.join(apps_dir, f)
-            found.append(Target(
-                "Applications (deep uninstall)", f[:-4], p, RISK_RISKY,
-                "removes app + ALL leftovers (caches, prefs, containers, "
-                "launch agents, receipts) — from / to ~",
-                ("uninstall", p)))
+    seen_apps = set()
+    for apps_dir in ("/Applications", os.path.join(HOME, "Applications")):
+        if not os.path.isdir(apps_dir):
+            continue
+        # find .app bundles up to 2 levels deep (catches /Applications/Utilities etc.)
+        try:
+            out = subprocess.run(
+                ["find", apps_dir, "-maxdepth", "2", "-name", "*.app",
+                 "-type", "d", "-prune"],
+                capture_output=True, text=True, timeout=60)
+            for p in sorted(out.stdout.strip().splitlines()):
+                f = os.path.basename(p)
+                if f.startswith(".") or f in seen_apps:
+                    continue
+                seen_apps.add(f)
+                found.append(Target(
+                    "Applications (deep uninstall)", f[:-4], p, RISK_RISKY,
+                    "removes app + ALL leftovers (caches, prefs, containers, "
+                    "launch agents, receipts) — from / to ~",
+                    ("uninstall", p)))
+        except Exception:
+            pass
 
-    progress_cb("Mapping storage hogs...")
-    for d in ("Pictures", "Desktop", "Documents", "Movies", "Music"):
-        p = os.path.join(HOME, d)
-        if os.path.isdir(p):
-            found.append(Target("Storage Hogs (info only)", f"~/{d}", p,
-                                RISK_INFO, "personal files — review manually",
-                                ("info", None)))
+    # -- big macOS space-eaters people forget --
+    progress_cb("Checking iOS backups, Mail downloads, system caches...")
+    ios = os.path.join(HOME, "Library/Application Support/MobileSync/Backup")
+    if os.path.isdir(ios):
+        found.append(Target(
+            "System & Backups", "iOS device backups", ios, RISK_RISKY,
+            "old iPhone/iPad backups — re-back-up from device before deleting",
+            ("rm_contents", ios)))
+    mail = os.path.join(
+        HOME, "Library/Containers/com.apple.mail/Data/Library/Mail Downloads")
+    if os.path.isdir(mail):
+        found.append(Target(
+            "System & Backups", "Mail attachment downloads", mail, RISK_SAFE,
+            "copies of attachments — originals stay in Mail",
+            ("rm_contents", mail)))
+    if os.path.isdir("/Library/Caches"):
+        found.append(Target(
+            "System & Backups", "System caches (/Library/Caches)",
+            "/Library/Caches", RISK_CAUTION,
+            "needs admin; apps rebuild caches",
+            ("sudo_rm_contents", "/Library/Caches")))
+    try:
+        snaps = subprocess.run(["tmutil", "listlocalsnapshots", "/"],
+                               capture_output=True, text=True, timeout=15)
+        n_snaps = len([l for l in snaps.stdout.splitlines()
+                       if "com.apple" in l])
+        if n_snaps:
+            found.append(Target(
+                "System & Backups",
+                f"Time Machine local snapshots ({n_snaps})", None,
+                RISK_CAUTION,
+                "thins local APFS snapshots (tmutil thinlocalsnapshots)",
+                ("cmd", ["tmutil", "thinlocalsnapshots", "/",
+                         "999999999999", "4"])))
+    except Exception:
+        pass
+
+    # -- deep map: biggest folders anywhere in home, not just known caches.
+    # This is what makes the scan account for *all* used space, so the total
+    # tracks the actual disk instead of only the categories we hard-coded. --
+    progress_cb("Mapping largest folders in home (deep)...")
+    try:
+        out = subprocess.run(["du", "-skA", "-d", "2", HOME],
+                             capture_output=True, text=True, timeout=300)
+        rows = []
+        for ln in out.stdout.splitlines():
+            parts = ln.split("\t") if "\t" in ln else ln.rsplit(None, 1)
+            if len(parts) != 2:
+                continue
+            kb, path = parts
+            if not kb.isdigit() or path == HOME:
+                continue
+            sz = int(kb) * 1024
+            if sz > 1024 ** 3:          # only folders bigger than 1 GB
+                rows.append((sz, path))
+        rows.sort(reverse=True)
+        for sz, path in rows[:25]:
+            tgt = Target("Largest Folders (info only)", path.replace(HOME, "~"),
+                         path, RISK_INFO,
+                         "biggest folders on disk — double-click to reveal, "
+                         "review manually", ("info", None))
+            tgt.size = sz
+            tgt.age = age_days(path)
+            found.append(tgt)
+    except Exception:
+        pass
     return found
 
 
 # ---------------------------------------------------------------- cleaning
 
-def sudo_shell(cmd: str, pw, timeout=600):
-    """Run a shell command as root.
-
-    With a stored password -> non-interactive `sudo -S`.
-    Without one -> native macOS admin dialog (and a notification so the
-    user knows action is required).
-    """
-    if pw:
-        r = subprocess.run(["sudo", "-S", "-p", "", "sh", "-c", cmd],
-                           input=pw + "\n", capture_output=True, text=True,
-                           timeout=timeout)
-        if r.returncode != 0 and "try again" in r.stderr.lower():
-            return False, "wrong admin password"
-        return r.returncode == 0, (r.stderr.strip()[:200] or "ok (admin)")
+def sudo_shell(cmd: str, timeout=600):
+    """Run a shell command as root via the native macOS admin dialog —
+    the single, standard place the user enters their password."""
     notify("Action needed: enter your admin password in the dialog")
     esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
     script = f'do shell script "{esc}" with administrator privileges'
@@ -416,7 +601,7 @@ def find_leftovers(app_path: str):
     return bid, hits
 
 
-def uninstall_app(app_path: str, pw, log):
+def uninstall_app(app_path: str, log):
     """Remove app bundle + all leftovers. Root-owned paths go through sudo."""
     if not os.path.isdir(app_path):
         return False, "app not found"
@@ -433,18 +618,18 @@ def uninstall_app(app_path: str, pw, log):
     for p in root_paths:
         log(f"   rm (admin) {p}")
     ok, msg = sudo_shell(
-        "rm -rf " + " ".join(shlex.quote(p) for p in root_paths), pw)
+        "rm -rf " + " ".join(shlex.quote(p) for p in root_paths))
     if not ok:
         return False, f"admin removal failed: {msg}"
     if bid:  # forget installer receipts too
         sudo_shell(f"pkgutil --pkgs | grep -F {shlex.quote(bid)} | "
-                   f"xargs -n1 pkgutil --forget 2>/dev/null || true", pw,
+                   f"xargs -n1 pkgutil --forget 2>/dev/null || true",
                    timeout=60)
     log(f"   removed {1 + len(leftovers)} paths")
     return True, f"uninstalled ({len(leftovers)} leftovers swept)"
 
 
-def clean_target(tgt: Target, pw=None, log=lambda m: None):
+def clean_target(tgt: Target, log=lambda m: None):
     kind, arg = tgt.clean
     try:
         if kind == "info":
@@ -462,10 +647,10 @@ def clean_target(tgt: Target, pw=None, log=lambda m: None):
             return True, "emptied"
         if kind == "sudo_rm_contents":
             return sudo_shell(f"find {shlex.quote(arg)} -mindepth 1 "
-                              f"-maxdepth 1 -exec rm -rf {{}} +", pw,
+                              f"-maxdepth 1 -exec rm -rf {{}} +",
                               timeout=300)
         if kind == "uninstall":
-            return uninstall_app(arg, pw, log)
+            return uninstall_app(arg, log)
     except Exception as e:
         return False, str(e)[:200]
     return False, "unknown clean method"
@@ -532,6 +717,135 @@ class CleanWindow:
             pass
 
 
+class ProcTable:
+    """Reusable process table with 🟢 SAFE / 🟠 CAUTION / ⚪ SYSTEM category
+    rows and checkbox selection — click a row to tick it, click a category
+    header to tick the whole group (same behaviour as the Storage tab's
+    categories). Used by the RAM tab; each metric column is caller-defined."""
+
+    ICONS = {"SAFE": "🟢", "CAUTION": "🟠", "SYSTEM": "⚪"}
+
+    def __init__(self, parent, columns,
+                 heading0="Process — click ☐ to select, category to select all"):
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(wrap, columns=[c[0] for c in columns],
+                                 show="tree headings", selectmode="none")
+        self.tree.heading("#0", text=heading0)
+        self.tree.column("#0", width=430, anchor="w")
+        for cid, label, w in columns:
+            self.tree.heading(cid, text=label)
+            self.tree.column(cid, width=w, anchor="center")
+        self.tree.tag_configure("hot", foreground="#ef4444")
+        self.tree.tag_configure("warm", foreground="#f59e0b")
+        self.tree.tag_configure("SYSTEM", foreground="#6b7280")
+        self.tree.tag_configure("hcat", font=("", 12, "bold"))
+        for safety in ("SAFE", "CAUTION", "SYSTEM"):
+            self.tree.insert("", "end", iid=f"cat::{safety}", open=True,
+                             tags=("hcat",),
+                             text=self.ICONS[safety] + f" {safety}")
+        ysb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ysb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ysb.pack(side="left", fill="y")
+        self.tree.bind("<Button-1>", self._click)
+        self.checked = set()   # pids (str)
+        self.info = {}         # pid -> (name, safety)
+
+    def _cat(self, safety):
+        cid = f"cat::{safety}"
+        if not self.tree.exists(cid):
+            self.tree.insert("", "end", iid=cid, open=True, tags=("hcat",),
+                             text=self.ICONS[safety] + f" {safety}")
+        return cid
+
+    def _row_text(self, iid):
+        name, safety = self.info.get(iid, ("?", ""))
+        mark = ("☑" if iid in self.checked
+                else "—" if safety == "SYSTEM" else "☐")
+        self.tree.item(iid, text=f"{mark}  {name}")
+
+    def _update_cat(self, safety):
+        cid = f"cat::{safety}"
+        if not self.tree.exists(cid):
+            return
+        kids = self.tree.get_children(cid)
+        mark = "" if safety == "SYSTEM" else (
+            "☑ " if kids and all(k in self.checked for k in kids) else "☐ ")
+        self.tree.item(cid, text=f"{mark}{self.ICONS[safety]} "
+                                 f"{safety} — {len(kids)} processes")
+
+    def _click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid.startswith("cat::"):
+            safety = iid.split("::", 1)[1]
+            if safety == "SYSTEM":
+                return
+            kids = self.tree.get_children(iid)
+            all_on = kids and all(k in self.checked for k in kids)
+            for k in kids:
+                self.checked.discard(k) if all_on else self.checked.add(k)
+                self._row_text(k)
+            self._update_cat(safety)
+            return
+        _, safety = self.info.get(iid, ("", "SYSTEM"))
+        if safety == "SYSTEM":
+            return
+        self.checked.discard(iid) if iid in self.checked else \
+            self.checked.add(iid)
+        self._row_text(iid)
+        self._update_cat(safety)
+
+    def select_safe(self):
+        for pid, (_, safety) in self.info.items():
+            if safety == "SAFE" and self.tree.exists(pid):
+                self.checked.add(pid)
+                self._row_text(pid)
+        for s in ("SAFE", "CAUTION"):
+            self._update_cat(s)
+
+    def deselect(self):
+        for pid in list(self.checked):
+            self.checked.discard(pid)
+            if self.tree.exists(pid):
+                self._row_text(pid)
+        for s in ("SAFE", "CAUTION"):
+            self._update_cat(s)
+
+    def update(self, rows, sort_key):
+        """rows: list of {pid,name,safety,values,tags}. sort_key(tree,iid)->
+        float sorts each category descending. Updates in place so checkbox
+        state and selection survive a refresh."""
+        live = set()
+        for r in rows:
+            pid = r["pid"]
+            live.add(pid)
+            self.info[pid] = (r["name"], r["safety"])
+            parent = self._cat(r["safety"])
+            if self.tree.exists(pid):
+                if self.tree.parent(pid) != parent:
+                    self.tree.move(pid, parent, "end")
+                self.tree.item(pid, values=r["values"], tags=r["tags"])
+            else:
+                self.tree.insert(parent, "end", iid=pid,
+                                 values=r["values"], tags=r["tags"])
+            self._row_text(pid)
+        for parent in self.tree.get_children(""):
+            for iid in self.tree.get_children(parent):
+                if iid not in live:
+                    self.tree.delete(iid)
+                    self.checked.discard(iid)
+                    self.info.pop(iid, None)
+        for parent in self.tree.get_children(""):
+            kids = sorted(self.tree.get_children(parent),
+                          key=lambda i: sort_key(self.tree, i), reverse=True)
+            for pos, k in enumerate(kids):
+                self.tree.move(k, parent, pos)
+            self._update_cat(parent.split("::", 1)[1])
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -544,13 +858,24 @@ class App:
         self._batch_start = 0
         self.clean_win = None
         self.q = queue.Queue()
-        self.pw_var = tk.StringVar()
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.apply_filter())
 
         self._build_dashboard()
-        self._build_toolbar()
-        self._build_tree()
+
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True)
+        self.tab_storage = ttk.Frame(self.nb)
+        self.tab_heat = ttk.Frame(self.nb)
+        self.tab_ram = ttk.Frame(self.nb)
+        self.nb.add(self.tab_storage, text="💾 Storage")
+        self.nb.add(self.tab_heat, text="🌡 Heat / CPU")
+        self.nb.add(self.tab_ram, text="🧠 RAM")
+
+        self._build_toolbar(self.tab_storage)
+        self._build_tree(self.tab_storage)
+        self._build_heat_tab(self.tab_heat)
+        self._build_ram_tab(self.tab_ram)
 
         self.status = ttk.Label(root, text="Ready — click  🔍 Deep Scan",
                                 padding=(10, 6))
@@ -559,6 +884,14 @@ class App:
 
         self.refresh_dashboard()
         self.root.after(120, self.poll)
+
+        # force window to front when launched from Finder/Dock, then
+        # kick off the scan automatically — no extra click needed
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(800, lambda: root.attributes("-topmost", False))
+        root.focus_force()
+        root.after(300, self.scan)
 
     # ---------- dashboard ----------
     def _build_dashboard(self):
@@ -601,12 +934,12 @@ class App:
 
     def refresh_dashboard(self):
         try:
-            u = shutil.disk_usage(HOME)
-            pct = u.used / u.total
+            total, used, free = disk_stats()
+            pct = used / total
             self.disk_label.config(
-                text=f"Disk  {fmt_size(u.used)} used of {fmt_size(u.total)}")
+                text=f"Disk  {fmt_size(used)} used of {fmt_size(total)}")
             self.disk_sub.config(
-                text=f"{fmt_size(u.free)} free  ·  {pct:.0%} full")
+                text=f"{fmt_size(free)} free  ·  {pct:.0%} full")
             self.disk_canvas.delete("all")
             w = self.disk_canvas.winfo_width() or 500
             color = "#ef4444" if pct > 0.9 else "#f59e0b" if pct > 0.75 else "#22c55e"
@@ -623,8 +956,8 @@ class App:
         self.tile_vars["items"].config(text=str(len(self.targets)) if self.targets else "—")
 
     # ---------- toolbar ----------
-    def _build_toolbar(self):
-        top = ttk.Frame(self.root, padding=(10, 8))
+    def _build_toolbar(self, parent):
+        top = ttk.Frame(parent, padding=(10, 8))
         top.pack(fill="x")
         self.btn_scan = ttk.Button(top, text="🔍 Deep Scan", command=self.scan)
         self.btn_scan.pack(side="left")
@@ -639,9 +972,6 @@ class App:
         self.btn_dev = ttk.Button(top, text="🧹 dev-cleaner",
                                   command=self.run_dev_cleaner)
         self.btn_dev.pack(side="left", padx=(10, 0))
-        ttk.Label(top, text="🔑 Admin pw:").pack(side="left", padx=(14, 2))
-        ttk.Entry(top, textvariable=self.pw_var, show="•", width=13
-                  ).pack(side="left")
         self.btn_clean = ttk.Button(top, text="🗑  Clean selected…",
                                     command=self.confirm_clean, state="disabled")
         self.btn_clean.pack(side="right")
@@ -650,7 +980,7 @@ class App:
         ttk.Label(top, text="Filter:").pack(side="right")
 
         # clickable risk chips — click one to select everything at that risk
-        chips = tk.Frame(self.root, padx=10)
+        chips = tk.Frame(parent, padx=10)
         chips.pack(fill="x")
         self.chip_labels = {}
         for risk in (RISK_SAFE, RISK_CAUTION, RISK_RISKY):
@@ -672,8 +1002,8 @@ class App:
                             f"{fmt_size(sum(t.size for t in items))}")
 
     # ---------- tree ----------
-    def _build_tree(self):
-        wrap = ttk.Frame(self.root)
+    def _build_tree(self, parent):
+        wrap = ttk.Frame(parent)
         wrap.pack(fill="both", expand=True, padx=10, pady=(0, 4))
         cols = ("before", "after", "freed", "risk", "age", "note")
         self.tree = ttk.Treeview(wrap, columns=cols, show="tree headings",
@@ -699,7 +1029,312 @@ class App:
         self.tree.bind("<Button-1>", self.on_click)
         self.tree.bind("<Double-1>", self.on_double)
 
+    # ---------- heat / CPU tab ----------
+    def _build_heat_tab(self, parent):
+        frame = ttk.Frame(parent, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        # -- headline verdicts --
+        self.load_label = ttk.Label(frame, font=("", 13, "bold"))
+        self.load_label.pack(anchor="w")
+        self.therm_label = ttk.Label(frame, font=("", 12))
+        self.therm_label.pack(anchor="w")
+        self.mem_label = ttk.Label(frame, font=("", 12))
+        self.mem_label.pack(anchor="w", pady=(0, 6))
+
+        # -- live CPU graph (last 2 minutes) --
+        gwrap = tk.Frame(frame, bg=BG)
+        gwrap.pack(fill="x", pady=(0, 8))
+        tk.Label(gwrap, text="CPU usage — last 2 minutes", bg=BG,
+                 fg="#9ca3af", font=("", 10)).pack(anchor="w", padx=8,
+                                                   pady=(6, 0))
+        self.heat_canvas = tk.Canvas(gwrap, height=90, bg=BG,
+                                     highlightthickness=0)
+        self.heat_canvas.pack(fill="x", padx=8, pady=(2, 8))
+        self.cpu_history = []  # rolling list of overall-CPU %
+
+        # -- action bar --
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Select all SAFE",
+                   command=lambda: self.heat_table.select_safe()
+                   ).pack(side="left")
+        ttk.Button(bar, text="Deselect",
+                   command=lambda: self.heat_table.deselect()
+                   ).pack(side="left", padx=4)
+        ttk.Button(bar, text="⛔ Terminate selected…",
+                   command=self.kill_selected).pack(side="left", padx=(8, 0))
+        ttk.Label(bar, text="  🟢 SAFE quit anytime · 🟠 CAUTION may lose "
+                            "unsaved work · ⚪ SYSTEM cannot be selected"
+                  ).pack(side="left")
+
+        # -- process table (shared component: categories + checkboxes) --
+        self.heat_table = ProcTable(
+            frame, [("cpu", "CPU %", 70), ("mem", "MEM %", 70),
+                    ("time", "CPU time", 90), ("safety", "Safety", 110)])
+        self._refresh_heat()
+        self._refresh_therm()
+
+    def _refresh_heat(self):
+        ncpu = os.cpu_count() or 1
+        try:
+            load1, load5, load15 = os.getloadavg()
+            flag = "  🔥 HIGH LOAD — machine will heat up" \
+                if load1 > ncpu else "  ✅ normal"
+            self.load_label.config(
+                text=f"Load avg (1/5/15m): {load1:.2f} / {load5:.2f} / "
+                     f"{load15:.2f}   ·   {ncpu} cores{flag}")
+        except Exception:
+            pass
+        try:
+            _, _, _, swap = mem_stats()
+            warn = ("  ⚠️ swapping = extra heat"
+                    if swap.rstrip("M.0") not in ("", "0") else "")
+            self.mem_label.config(text=f"💾 Swap used: {swap}{warn}")
+        except Exception:
+            pass
+        try:
+            out = subprocess.run(
+                ["ps", "-Ao", "pid,pcpu,pmem,time,comm", "-r"],
+                capture_output=True, text=True, timeout=5)
+            lines = out.stdout.strip().splitlines()[1:]
+            total_cpu = min(sum(_f(l.split(None, 2)[1]) for l in lines
+                                if len(l.split(None, 2)) > 1) / ncpu, 100)
+            self.cpu_history = (self.cpu_history + [total_cpu])[-60:]
+            self._draw_graph()
+
+            rows = []
+            for ln in lines[:30]:
+                parts = ln.split(None, 4)
+                if len(parts) < 5:
+                    continue
+                pid, cpu, mem, cput, path = parts
+                name = os.path.basename(path)
+                safety = proc_safety(path, name)
+                icon = ProcTable.ICONS[safety]
+                tag = ("hot" if _f(cpu) > 80 else "warm" if _f(cpu) > 30
+                       else "SYSTEM" if safety == "SYSTEM" else "")
+                rows.append({
+                    "pid": pid, "name": name, "safety": safety,
+                    "values": (cpu, mem, cput, f"{icon} {safety}"),
+                    "tags": (tag,)})
+            self.heat_table.update(
+                rows, lambda tree, i: _f(tree.set(i, "cpu")))
+        except Exception:
+            pass
+        # ponytail: polls ps every 2s, cheap enough — no daemon/watcher needed
+        self.root.after(2000, self._refresh_heat)
+
+    def _draw_graph(self):
+        c = self.heat_canvas
+        c.delete("all")
+        w = c.winfo_width() or 800
+        h = 90
+        # guide lines at 25/50/75%
+        for pct in (25, 50, 75):
+            y = h - h * pct / 100
+            c.create_line(0, y, w, y, fill="#1f2937")
+            c.create_text(4, y, text=f"{pct}%", anchor="w",
+                          fill="#4b5563", font=("", 8))
+        pts = self.cpu_history
+        if len(pts) < 2:
+            return
+        step = w / 59
+        coords = []
+        for i, v in enumerate(pts):
+            coords += [i * step + (60 - len(pts)) * step, h - h * v / 100]
+        cur = pts[-1]
+        color = "#ef4444" if cur > 75 else "#f59e0b" if cur > 40 else "#22c55e"
+        c.create_line(*coords, fill=color, width=2, smooth=True)
+        c.create_text(w - 6, 10, text=f"{cur:.0f}%", anchor="e",
+                      fill=color, font=("", 12, "bold"))
+
+    def _refresh_therm(self):
+        """Thermal throttling status — the direct 'is my Mac hot' signal."""
+        try:
+            out = subprocess.run(["pmset", "-g", "therm"],
+                                 capture_output=True, text=True, timeout=5)
+            limit = 100
+            for ln in out.stdout.splitlines():
+                if "CPU_Speed_Limit" in ln:
+                    limit = int(ln.split("=")[1].strip())
+            if limit < 100:
+                self.therm_label.config(
+                    text=f"🔥 THERMAL THROTTLING: CPU capped at {limit}% — "
+                         f"macOS is slowing the CPU to cool down",
+                    foreground="#ef4444")
+            else:
+                self.therm_label.config(
+                    text="🌡 Thermal state: OK — no CPU throttling",
+                    foreground="#16a34a")
+        except Exception:
+            self.therm_label.config(text="🌡 Thermal state: unavailable")
+        self.root.after(10000, self._refresh_therm)
+
+    def _alive(self, pid):
+        # ps -p works regardless of who owns the process
+        return subprocess.run(["ps", "-p", pid],
+                              capture_output=True).returncode == 0
+
+    def _kill_pids(self, pids):
+        """Actually terminate. SIGTERM first (lets apps save), brief grace,
+        then SIGKILL survivors, then admin SIGKILL for anything still up.
+        Polite SIGTERM alone often does nothing — apps trap it — so a plain
+        `kill` looked successful while the process stayed alive. Returns the
+        set of pids confirmed dead. (Helper/renderer procs may be respawned
+        by their parent app — kill the main app to truly reclaim its RAM.)"""
+        pids = [p for p in pids if self._alive(p)]
+        for p in pids:
+            subprocess.run(["kill", "-15", p], capture_output=True)
+        time.sleep(0.8)
+        survivors = [p for p in pids if self._alive(p)]
+        for p in survivors:
+            subprocess.run(["kill", "-9", p], capture_output=True)
+        time.sleep(0.4)
+        stubborn = [p for p in pids if self._alive(p)]
+        if stubborn:   # not ours → one admin prompt for all of them
+            sudo_shell("kill -9 " + " ".join(shlex.quote(p) for p in stubborn))
+            time.sleep(0.3)
+        return {p for p in pids if not self._alive(p)}
+
+    def kill_selected(self):
+        picks = [(p, *self.heat_table.info.get(p, ("?", "?")))
+                 for p in self.heat_table.checked
+                 if self.heat_table.tree.exists(p)]
+        if not picks:
+            messagebox.showinfo("Heat", "Tick ☐ next to one or more "
+                                        "processes first.")
+            return
+        caution = [n for _, n, s in picks if s == "CAUTION"]
+        msg = "Terminate these processes?\n\n" + "\n".join(
+            f"  • {n} (PID {p})" for p, n, _ in picks)
+        if caution:
+            msg += ("\n\n🟠 May lose unsaved work in: "
+                    + ", ".join(caution))
+        if not messagebox.askyesno("Terminate", msg):
+            return
+        dead = self._kill_pids([p for p, _, _ in picks])
+        self.heat_table.checked.clear()
+        for safety in ("SAFE", "CAUTION"):
+            self.heat_table._update_cat(safety)
+        self.status.config(
+            text=f"Terminated {len(dead)}/{len(picks)} process(es)")
+
+    # ---------- RAM tab ----------
+    def _build_ram_tab(self, parent):
+        frame = ttk.Frame(parent, padding=10)
+        frame.pack(fill="both", expand=True)
+        self.ram_head = ttk.Label(frame, font=("", 13, "bold"))
+        self.ram_head.pack(anchor="w")
+        self.ram_sub = ttk.Label(frame, font=("", 12))
+        self.ram_sub.pack(anchor="w", pady=(0, 6))
+
+        gwrap = tk.Frame(frame, bg=BG)
+        gwrap.pack(fill="x", pady=(0, 8))
+        tk.Label(gwrap, text="Memory in use", bg=BG, fg="#9ca3af",
+                 font=("", 10)).pack(anchor="w", padx=8, pady=(6, 0))
+        self.ram_canvas = tk.Canvas(gwrap, height=16, bg="#374151",
+                                    highlightthickness=0)
+        self.ram_canvas.pack(fill="x", padx=8, pady=(2, 8))
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Select all SAFE",
+                   command=lambda: self.ram_table.select_safe()).pack(side="left")
+        ttk.Button(bar, text="Deselect",
+                   command=lambda: self.ram_table.deselect()).pack(side="left",
+                                                                    padx=4)
+        ttk.Button(bar, text="⛔ Free RAM (quit selected)…",
+                   command=self.ram_free).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="🧹 Purge inactive (admin)",
+                   command=self.ram_purge).pack(side="left", padx=(8, 0))
+        ttk.Label(bar, text="  🟢 SAFE quit anytime · 🟠 CAUTION may lose "
+                            "unsaved work · ⚪ SYSTEM cannot be selected"
+                  ).pack(side="left")
+
+        self.ram_table = ProcTable(
+            frame, [("mem", "MEM %", 70), ("rss", "RAM", 100),
+                    ("safety", "Safety", 110)])
+        self._refresh_ram()
+
+    def _refresh_ram(self):
+        try:
+            total, used, comp, swap = mem_stats()
+            pct = used / total if total else 0
+            self.ram_head.config(
+                text=f"RAM  {fmt_size(used)} used of {fmt_size(total)}  ·  "
+                     f"{pct:.0%}")
+            warn = "  ⚠️ swapping — free some RAM" if swap.rstrip(
+                "M.0") not in ("", "0") else ""
+            self.ram_sub.config(
+                text=f"Compressed {fmt_size(comp)}   ·   Swap {swap}{warn}")
+            c = self.ram_canvas
+            c.delete("all")
+            w = c.winfo_width() or 500
+            color = ("#ef4444" if pct > 0.9 else "#f59e0b" if pct > 0.75
+                     else "#22c55e")
+            c.create_rectangle(0, 0, w * pct, 16, fill=color, width=0)
+        except Exception:
+            pass
+        try:
+            out = subprocess.run(["ps", "-Ao", "pid,pmem,rss,comm", "-m"],
+                                 capture_output=True, text=True, timeout=5)
+            rows = []
+            for ln in out.stdout.strip().splitlines()[1:31]:
+                parts = ln.split(None, 3)
+                if len(parts) < 4:
+                    continue
+                pid, mem, rss, path = parts
+                name = os.path.basename(path)
+                safety = proc_safety(path, name)
+                icon = ProcTable.ICONS[safety]
+                rss_b = _f(rss) * 1024   # ps rss is KiB
+                tag = ("hot" if _f(mem) > 20 else "warm" if _f(mem) > 8
+                       else "SYSTEM" if safety == "SYSTEM" else "")
+                rows.append({
+                    "pid": pid, "name": name, "safety": safety,
+                    "values": (mem, fmt_size(rss_b), f"{icon} {safety}"),
+                    "tags": (tag,)})
+            self.ram_table.update(
+                rows, lambda tree, i: _f(tree.set(i, "mem")))
+        except Exception:
+            pass
+        self.root.after(2000, self._refresh_ram)
+
+    def ram_free(self):
+        picks = [(p, *self.ram_table.info.get(p, ("?", "?")))
+                 for p in self.ram_table.checked if self.ram_table.tree.exists(p)]
+        if not picks:
+            messagebox.showinfo("RAM", "Tick ☐ next to one or more apps first.")
+            return
+        caution = [n for _, n, s in picks if s == "CAUTION"]
+        msg = "Quit these to free their RAM?\n\n" + "\n".join(
+            f"  • {n} (PID {p})" for p, n, _ in picks)
+        if caution:
+            msg += "\n\n🟠 May lose unsaved work in: " + ", ".join(caution)
+        if not messagebox.askyesno("Free RAM", msg):
+            return
+        dead = self._kill_pids([p for p, _, _ in picks])
+        self.ram_table.checked.clear()
+        for s in ("SAFE", "CAUTION"):
+            self.ram_table._update_cat(s)
+        self.status.config(
+            text=f"Freed RAM — terminated {len(dead)}/{len(picks)} app(s)")
+
+    def ram_purge(self):
+        if not messagebox.askyesno(
+                "Purge inactive memory",
+                "Flush inactive/cached memory with `sudo purge`?\n\n"
+                "Frees cached RAM immediately. Safe — disk caches just "
+                "rebuild. Needs admin."):
+            return
+        ok, msg = sudo_shell("purge")
+        self.status.config(text="Purged inactive memory"
+                           if ok else f"purge failed: {msg}")
+
     # ---------- scanning ----------
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
     def scan(self):
         self.btn_scan.config(state="disabled")
         self.tree.delete(*self.tree.get_children())
@@ -708,7 +1343,17 @@ class App:
         self.refresh_dashboard()
         self.progress.pack(side="bottom", fill="x")
         self.progress.start(10)
+        self._spin_i = 0
+        self._scanning = True
+        self._spin()
         threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _spin(self):
+        if not self._scanning:
+            return
+        self.btn_scan.config(text=f"{self.SPINNER[self._spin_i]} Scanning…")
+        self._spin_i = (self._spin_i + 1) % len(self.SPINNER)
+        self.root.after(120, self._spin)
 
     def _scan_worker(self):
         t0 = time.time()
@@ -742,9 +1387,10 @@ class App:
                     self.add_row(payload)
                     self.refresh_dashboard()
                 elif kind == "done":
+                    self._scanning = False
                     self.progress.stop()
                     self.progress.pack_forget()
-                    self.btn_scan.config(state="normal")
+                    self.btn_scan.config(state="normal", text="🔍 Deep Scan")
                     self.btn_clean.config(state="normal")
                     self.sort_tree()
                     self.refresh_dashboard()
@@ -926,11 +1572,10 @@ class App:
                          args=(list(self.checked),), daemon=True).start()
 
     def _clean_worker(self, iids):
-        pw = self.pw_var.get().strip() or None
         log = lambda m: self.q.put(("log", m))
         needs_sudo = any(self.targets[i].clean[0] in
                          ("sudo_rm_contents", "uninstall") for i in iids)
-        if needs_sudo and not pw:
+        if needs_sudo:
             notify("Some items need admin rights — watch for the "
                    "password dialog")
         failed = []
@@ -940,7 +1585,7 @@ class App:
             self.q.put(("cprog", (i - 1, head)))
             self.q.put(("status", f"Cleaning  {tgt.name} …"))
             log(f"→ {tgt.name}  ({fmt_size(tgt.size)})")
-            ok, msg = clean_target(tgt, pw, log)
+            ok, msg = clean_target(tgt, log)
             if ok:
                 after = du_bytes(tgt.path) if tgt.path and os.path.exists(
                     tgt.path) else 0
@@ -963,58 +1608,17 @@ class App:
     def run_dev_cleaner(self):
         if not messagebox.askyesno(
                 "dev-cleaner",
-                "Download and run the community dev-cleaner.sh script?\n"
-                "(auto-selects option 1, exits with 0)"):
+                "Open Terminal and run the community dev-cleaner.sh script?\n"
+                "You'll answer its menu prompts yourself."):
             return
-        self.btn_dev.config(state="disabled")
-        self.btn_clean.config(state="disabled")
-        self._batch_start = self.session_freed
-        self.clean_win = CleanWindow(self.root, 1)
-        threading.Thread(target=self._dev_cleaner_worker, daemon=True).start()
-
-    def _dev_cleaner_worker(self):
-        log = lambda m: self.q.put(("log", m))
-        try:
-            path = os.path.join(tempfile.gettempdir(), "dev-cleanup.sh")
-            log(f"Downloading {DEV_CLEANER_URL} …")
-            r = subprocess.run(["curl", "-fsSL", DEV_CLEANER_URL, "-o", path],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                log(f"❌ download failed: {r.stderr.strip()[:200]}")
-                notify("dev-cleaner download failed — check network")
-                return
-            os.chmod(path, 0o755)
-            pw = self.pw_var.get().strip()
-            if pw:
-                # prime sudo timestamp so the script's internal sudo calls pass
-                subprocess.run(["sudo", "-S", "-p", "", "-v"],
-                               input=pw + "\n", capture_output=True,
-                               text=True, timeout=30)
-            else:
-                notify("dev-cleaner may need admin rights — add your "
-                       "password in the 🔑 field to run unattended")
-            log("Running dev-cleaner.sh (answers: 1, then 0 to exit) …\n")
-            self.q.put(("cprog", (0, "dev-cleaner running…")))
-            proc = subprocess.Popen(
-                [path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True)
-            try:
-                # ponytail: option 1 once, then 0s so any repeated menu exits
-                proc.stdin.write("1\n" + "0\n" * 10)
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
-            for line in proc.stdout:
-                log(line.rstrip())
-            proc.wait(timeout=1800)
-            log(f"\ndev-cleaner exited with code {proc.returncode}")
-            notify("dev-cleaner finished")
-        except Exception as e:
-            log(f"❌ dev-cleaner error: {e}")
-            notify("dev-cleaner failed — see log")
-        finally:
-            self.q.put(("clean_done", None))
-            self.q.put(("status", "dev-cleaner finished."))
+        cmd = (f'curl -fsSL {DEV_CLEANER_URL} -o dev-cleanup.sh '
+               f'&& chmod +x dev-cleanup.sh && ./dev-cleanup.sh')
+        script = ('tell application "Terminal"\n'
+                  f'  do script "cd {shlex.quote(HOME)} && {cmd}"\n'
+                  '  activate\n'
+                  'end tell')
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+        notify("dev-cleaner running in Terminal — answer its prompts there")
 
     def mark_cleaned(self, iid, after):
         tgt = self.targets[iid]
