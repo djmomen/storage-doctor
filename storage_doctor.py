@@ -868,14 +868,17 @@ class App:
         self.tab_storage = ttk.Frame(self.nb)
         self.tab_heat = ttk.Frame(self.nb)
         self.tab_ram = ttk.Frame(self.nb)
+        self.tab_batt = ttk.Frame(self.nb)
         self.nb.add(self.tab_storage, text="💾 Storage")
         self.nb.add(self.tab_heat, text="🌡 Heat / CPU")
         self.nb.add(self.tab_ram, text="🧠 RAM")
+        self.nb.add(self.tab_batt, text="🔋 Battery")
 
         self._build_toolbar(self.tab_storage)
         self._build_tree(self.tab_storage)
         self._build_heat_tab(self.tab_heat)
         self._build_ram_tab(self.tab_ram)
+        self._build_batt_tab(self.tab_batt)
 
         self.status = ttk.Label(root, text="Ready — click  🔍 Deep Scan",
                                 padding=(10, 6))
@@ -1331,6 +1334,122 @@ class App:
         ok, msg = sudo_shell("purge")
         self.status.config(text="Purged inactive memory"
                            if ok else f"purge failed: {msg}")
+
+    # ---------- Battery tab ----------
+    def _build_batt_tab(self, parent):
+        frame = ttk.Frame(parent, padding=10)
+        frame.pack(fill="both", expand=True)
+        self.batt_head = ttk.Label(frame, font=("", 13, "bold"))
+        self.batt_head.pack(anchor="w")
+        self.batt_health = ttk.Label(frame, font=("", 12))
+        self.batt_health.pack(anchor="w")
+        self.batt_block = ttk.Label(frame, font=("", 12))
+        self.batt_block.pack(anchor="w", pady=(0, 6))
+
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Select all SAFE",
+                   command=lambda: self.batt_table.select_safe()).pack(side="left")
+        ttk.Button(bar, text="Deselect",
+                   command=lambda: self.batt_table.deselect()).pack(side="left",
+                                                                    padx=4)
+        ttk.Button(bar, text="⛔ Stop drain (quit selected)…",
+                   command=self.batt_free).pack(side="left", padx=(8, 0))
+        ttk.Label(bar, text="  🟢 SAFE quit anytime · 🟠 CAUTION may lose "
+                            "unsaved work · ⚪ SYSTEM cannot be selected"
+                  ).pack(side="left")
+
+        # ponytail: CPU% is the battery-drain proxy — per-process energy
+        # needs a 2s blocking `top -l 2`; ps is instant and ranks the same
+        self.batt_table = ProcTable(
+            frame, [("cpu", "CPU % (drain)", 100), ("time", "CPU time", 90),
+                    ("safety", "Safety", 110)])
+        self._refresh_batt()
+
+    def _batt_headline(self):
+        out = subprocess.run(["pmset", "-g", "batt"], capture_output=True,
+                             text=True, timeout=5).stdout
+        m = re.search(r"(\d+)%;\s*(\w[\w ]*?);(?:\s*([\d:]+) remaining)?", out)
+        if not m:
+            return "🔋 Battery: unavailable"
+        pct, state, rem = m.group(1), m.group(2), m.group(3)
+        src = "⚡ AC power" if "AC Power" in out else "🔋 battery"
+        txt = f"Battery  {pct}%  ·  {state}  ·  on {src}"
+        if rem and rem != "0:00":
+            txt += f"  ·  {rem} remaining"
+        return txt
+
+    def _batt_health_line(self):
+        out = subprocess.run(["ioreg", "-rn", "AppleSmartBattery"],
+                             capture_output=True, text=True, timeout=5).stdout
+        def g(key):
+            m = re.search(rf'"{key}" = (\d+)', out)
+            return int(m.group(1)) if m else 0
+        cycles = g("CycleCount")
+        design, nominal = g("DesignCapacity"), g("NominalChargeCapacity")
+        health = f"  ·  health {nominal / design:.0%}" if design and nominal else ""
+        return f"Cycles: {cycles}{health}" if cycles else ""
+
+    def _batt_blockers(self):
+        out = subprocess.run(["pmset", "-g", "assertions"],
+                             capture_output=True, text=True, timeout=5).stdout
+        names = sorted({m.group(1) for m in re.finditer(
+            r"pid \d+\(([^)]+)\).*?Prevent(?:UserIdle)?SystemSleep", out)})
+        return ("⚠️ Preventing sleep (drains battery when idle): "
+                + ", ".join(names)) if names else "✅ Nothing blocking sleep"
+
+    def _refresh_batt(self):
+        try:
+            self.batt_head.config(text=self._batt_headline())
+            self.batt_health.config(text=self._batt_health_line())
+            self.batt_block.config(text=self._batt_blockers())
+        except Exception:
+            pass
+        try:
+            out = subprocess.run(["ps", "-Ao", "pid,pcpu,time,comm", "-r"],
+                                 capture_output=True, text=True, timeout=5)
+            rows = []
+            for ln in out.stdout.strip().splitlines()[1:31]:
+                parts = ln.split(None, 3)
+                if len(parts) < 4:
+                    continue
+                pid, cpu, cput, path = parts
+                name = os.path.basename(path)
+                safety = proc_safety(path, name)
+                icon = ProcTable.ICONS[safety]
+                tag = ("hot" if _f(cpu) > 80 else "warm" if _f(cpu) > 30
+                       else "SYSTEM" if safety == "SYSTEM" else "")
+                rows.append({
+                    "pid": pid, "name": name, "safety": safety,
+                    "values": (cpu, cput, f"{icon} {safety}"),
+                    "tags": (tag,)})
+            self.batt_table.update(
+                rows, lambda tree, i: _f(tree.set(i, "cpu")))
+        except Exception:
+            pass
+        self.root.after(3000, self._refresh_batt)
+
+    def batt_free(self):
+        picks = [(p, *self.batt_table.info.get(p, ("?", "?")))
+                 for p in self.batt_table.checked
+                 if self.batt_table.tree.exists(p)]
+        if not picks:
+            messagebox.showinfo("Battery", "Tick ☐ next to one or more "
+                                           "processes first.")
+            return
+        caution = [n for _, n, s in picks if s == "CAUTION"]
+        msg = "Quit these battery drainers?\n\n" + "\n".join(
+            f"  • {n} (PID {p})" for p, n, _ in picks)
+        if caution:
+            msg += "\n\n🟠 May lose unsaved work in: " + ", ".join(caution)
+        if not messagebox.askyesno("Stop drain", msg):
+            return
+        dead = self._kill_pids([p for p, _, _ in picks])
+        self.batt_table.checked.clear()
+        for s in ("SAFE", "CAUTION"):
+            self.batt_table._update_cat(s)
+        self.status.config(
+            text=f"Stopped {len(dead)}/{len(picks)} battery drainer(s)")
 
     # ---------- scanning ----------
     SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
